@@ -1,0 +1,15 @@
+# nth: fire on exactly the first call to the wrapped tool.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: only-first-call
+    when: before
+    match: nth
+    n: 1
+    inject:
+      exception:
+        type: TimeoutError
+        message: "first call only"

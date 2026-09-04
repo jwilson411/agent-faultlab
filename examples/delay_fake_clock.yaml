@@ -1,0 +1,12 @@
+# delay_ms advances the fake clock by ten seconds. The wall clock does not move.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: slow-backend
+    when: before
+    match: always
+    inject:
+      delay_ms: 10000

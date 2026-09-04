@@ -1,0 +1,15 @@
+# after: let the real tool run, then replace its result with a malformed payload.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: shape-drift
+    when: after
+    match: always
+    inject:
+      malformed:
+        value:
+          status: "ok"
+          payload: null

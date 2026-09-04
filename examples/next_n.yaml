@@ -1,0 +1,15 @@
+# next_n: fire on calls 1..3, then let the tool run for real.
+version: 1
+seed: 7
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: first-three-fail
+    when: before
+    match: next_n
+    n: 3
+    inject:
+      exception:
+        type: ConnectionError
+        message: "backend unreachable"
