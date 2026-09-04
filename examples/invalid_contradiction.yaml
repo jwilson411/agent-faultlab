@@ -1,0 +1,20 @@
+# Invalid on purpose: 'always' overlaps call 2, and the two injects disagree.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: always-timeout
+    when: before
+    match: always
+    inject:
+      exception:
+        type: TimeoutError
+        message: "every call"
+  - id: second-call-returns
+    when: before
+    match: nth
+    n: 2
+    inject:
+      return: "ok"

@@ -1,0 +1,23 @@
+# Two injected transient failures, then the real backend answers.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: first-timeout
+    when: before
+    match: nth
+    n: 1
+    inject:
+      exception:
+        type: TimeoutError
+        message: "simulated timeout"
+  - id: second-connection-reset
+    when: before
+    match: nth
+    n: 2
+    inject:
+      exception:
+        type: ConnectionError
+        message: "simulated connection reset"

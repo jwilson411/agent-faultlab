@@ -1,0 +1,13 @@
+# Invalid on purpose: 'whn' is not a rule field. `faultlab validate` rejects it.
+version: 1
+seed: 42
+clock: fake
+target:
+  callable: examples.retry_subject:flaky_backend
+rules:
+  - id: typo
+    whn: before
+    when: before
+    match: always
+    inject:
+      delay_ms: 5
