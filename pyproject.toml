@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-faultlab"
 version = "0.1.0"
-description = "Deterministic callable fault injection and scenario runner for retry/fallback code."
+description = "Deterministic callable and HTTP fault injection for retry/fallback code."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

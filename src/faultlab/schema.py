@@ -15,7 +15,16 @@ import yaml
 
 WHEN_VALUES = ("before", "after")
 MATCH_VALUES = ("nth", "next_n", "always")
-INJECT_KINDS = ("delay_ms", "exception", "return", "malformed")
+INJECT_KINDS = ("delay_ms", "exception", "return", "malformed", "http")
+HTTP_ACTIONS = (
+    "status",
+    "timeout",
+    "close_before_headers",
+    "truncated_body",
+    "malformed_json",
+    "success",
+)
+HTTP_FIELDS = ("action", "status", "headers", "body", "retry_after")
 
 
 @dataclass(frozen=True)
@@ -37,11 +46,15 @@ class ScenarioError(Exception):
 
 @dataclass(frozen=True)
 class Inject:
-    kind: str  # delay | exception | return | malformed
+    kind: str  # delay | exception | return | malformed | http
     delay_ms: float | None = None
     exc_type: str | None = None
     exc_message: str = ""
     value: Any = None
+    action: str | None = None
+    status: int | None = None
+    headers: tuple[tuple[str, str], ...] = ()
+    retry_after: str | None = None
 
     @property
     def identity(self) -> str:
@@ -50,6 +63,11 @@ class Inject:
             return f"delay:{self.delay_ms!r}"
         if self.kind == "exception":
             return f"exception:{self.exc_type}:{self.exc_message}"
+        if self.kind == "http":
+            return (
+                f"http:{self.action}:{self.status}:{self.retry_after}:"
+                f"{_stable(list(self.headers))}:{_stable(self.value)}"
+            )
         return f"{self.kind}:{_stable(self.value)}"
 
     def describe(self) -> str:
@@ -57,6 +75,9 @@ class Inject:
             return f"delay_ms={self.delay_ms}"
         if self.kind == "exception":
             return f"exception {self.exc_type}"
+        if self.kind == "http":
+            suffix = f" {self.status}" if self.status is not None else ""
+            return f"http {self.action}{suffix}"
         return f"{self.kind} {_stable(self.value)}"
 
 
@@ -296,6 +317,15 @@ def _validate_rule(raw: Any, path: str, errors: list[ValidationError]) -> Rule |
 
     inject = _validate_inject(raw.get("inject"), f"{path}.inject", errors)
 
+    if inject is not None and inject.kind == "http" and when == "after":
+        errors.append(
+            ValidationError(
+                f"{path}.when",
+                "http injects are the response itself; only 'before' is allowed",
+            )
+        )
+        return None
+
     if inject is None or rule_id is None or when not in WHEN_VALUES or match not in MATCH_VALUES:
         return None
     if match in ("nth", "next_n") and n is None:
@@ -381,6 +411,9 @@ def _validate_inject(raw: Any, path: str, errors: list[ValidationError]) -> Inje
     if kind == "return":
         return Inject(kind="return", value=raw["return"])
 
+    if kind == "http":
+        return _validate_http(raw["http"], f"{path}.http", errors)
+
     spec = raw["malformed"]
     if not isinstance(spec, dict):
         errors.append(
@@ -398,6 +431,96 @@ def _validate_inject(raw: Any, path: str, errors: list[ValidationError]) -> Inje
         )
         return None
     return Inject(kind="malformed", value=spec["value"])
+
+
+def _validate_http(raw: Any, path: str, errors: list[ValidationError]) -> Inject | None:
+    if not isinstance(raw, dict):
+        errors.append(ValidationError(path, "must be a mapping with an 'action' field"))
+        return None
+    for key in raw:
+        if key not in HTTP_FIELDS:
+            errors.append(
+                ValidationError(
+                    f"{path}.{key}", "unknown field; allowed: " + ", ".join(sorted(HTTP_FIELDS))
+                )
+            )
+
+    action = raw.get("action")
+    if action is None:
+        errors.append(
+            ValidationError(f"{path}.action", "required; allowed: " + ", ".join(HTTP_ACTIONS))
+        )
+        return None
+    if action not in HTTP_ACTIONS:
+        errors.append(
+            ValidationError(
+                f"{path}.action", f"got {action!r}; allowed: " + ", ".join(HTTP_ACTIONS)
+            )
+        )
+        return None
+
+    status = raw.get("status")
+    if action == "status":
+        if status is None:
+            errors.append(
+                ValidationError(
+                    f"{path}.status", "required when action is 'status'; an HTTP status code"
+                )
+            )
+            return None
+        if not _is_int(status) or not 100 <= status <= 599:
+            errors.append(
+                ValidationError(
+                    f"{path}.status", f"must be an integer in 100..599, got {status!r}"
+                )
+            )
+            return None
+    elif status is not None:
+        errors.append(
+            ValidationError(f"{path}.status", f"only allowed when action is 'status', not {action!r}")
+        )
+        return None
+
+    headers: tuple[tuple[str, str], ...] = ()
+    raw_headers = raw.get("headers")
+    if raw_headers is not None:
+        if not isinstance(raw_headers, dict):
+            errors.append(ValidationError(f"{path}.headers", "must be a mapping of str to str"))
+            return None
+        bad = [
+            key
+            for key, value in raw_headers.items()
+            if not isinstance(key, str) or not isinstance(value, str)
+        ]
+        if bad:
+            errors.append(
+                ValidationError(
+                    f"{path}.headers", "header names and values must be strings"
+                )
+            )
+            return None
+        headers = tuple(sorted((str(k), str(v)) for k, v in raw_headers.items()))
+
+    retry_after = raw.get("retry_after")
+    if retry_after is not None:
+        if not (isinstance(retry_after, str) or _is_int(retry_after)):
+            errors.append(
+                ValidationError(
+                    f"{path}.retry_after",
+                    f"must be a string or an integer number of seconds, got {retry_after!r}",
+                )
+            )
+            return None
+        retry_after = str(retry_after)
+
+    return Inject(
+        kind="http",
+        action=action,
+        status=int(status) if status is not None else None,
+        headers=headers,
+        value=raw.get("body"),
+        retry_after=retry_after,
+    )
 
 
 def _overlaps(left: Rule, right: Rule) -> bool:

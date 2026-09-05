@@ -1,0 +1,15 @@
+# The loopback HTTP server answers the first two requests with 429 and a
+# Retry-After of 2 seconds, then falls through to the default 200 success.
+version: 1
+seed: 42
+clock: fake
+rules:
+  - id: rate-limited
+    when: before
+    match: next_n
+    n: 2
+    inject:
+      http:
+        action: status
+        status: 429
+        retry_after: 2
