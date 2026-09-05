@@ -1,0 +1,22 @@
+# Crash the worker after it announces that it is about to commit, so the
+# restart has to work out for itself whether the side effect already landed.
+#
+#   faultlab recovery-run examples/recovery_crash_before_commit.yaml -- \
+#       python examples/recovery_worker.py
+#
+# SIGKILL is asynchronous, so the worker may die before the ledger write, in
+# the middle of it, or just after it. Every one of those lands on a restart
+# that commits the message exactly once, which is the point of the scenario.
+version: 1
+kind: recovery
+seed: 1
+kill:
+  when: after
+  checkpoint: pre_commit
+limits:
+  runtime_ms: 10000
+  max_restarts: 1
+  max_output_bytes: 65536
+assertions:
+  - exactly-once
+  - at-most-once

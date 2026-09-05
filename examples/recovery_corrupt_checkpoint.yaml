@@ -1,0 +1,29 @@
+# Crash the worker straight after it starts, then let the restart run into a
+# checkpoint file it cannot read.
+#
+# This scenario needs a state directory that already holds a damaged
+# checkpoint, so point FAULTLAB_STATE_DIR at one; the harness uses the
+# directory you supply and does not delete it:
+#
+#   mkdir -p /tmp/faultlab-corrupt
+#   printf 'not json' > /tmp/faultlab-corrupt/checkpoint.json
+#   FAULTLAB_STATE_DIR=/tmp/faultlab-corrupt \
+#       faultlab recovery-run examples/recovery_corrupt_checkpoint.yaml -- \
+#       python examples/recovery_worker.py
+#
+# The restart emits begin, reads the damaged file, emits an error event and
+# exits 2 without sending anything. The report says ok false with the reason
+# worker_error, and the exit code is 1.
+version: 1
+kind: recovery
+seed: 3
+kill:
+  when: after
+  checkpoint: begin
+limits:
+  runtime_ms: 10000
+  max_restarts: 1
+  max_output_bytes: 65536
+assertions:
+  - exactly-once
+  - at-most-once

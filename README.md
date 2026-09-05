@@ -34,6 +34,7 @@ Python 3.11+. The only runtime dependency is PyYAML.
 faultlab validate PATH
 faultlab run PATH module:function [args...]
 faultlab oracle LEDGER [--assert NAME]... [--json-out PATH] [--junit PATH]
+faultlab recovery-run SCENARIO [--json-out PATH] [--junit PATH] -- COMMAND [args...]
 ```
 
 `validate` loads and checks a scenario and never imports or executes the subject.
@@ -335,6 +336,125 @@ at-most-once, the idempotent client ran it once and passes all three. Nothing he
 or reads the wall clock; the ledgers land in a temporary directory unless `--ledger DIR` says
 otherwise.
 
+## Crash/restart recovery harness
+
+An in-process oracle can only see side effects the process survived to record. A worker that is
+killed mid-write and restarted is a different question: does the restart finish the work, or does
+it send the message a second time? `faultlab recovery-run` runs the worker as a local subprocess,
+kills it at a named point, restarts it against the same state directory, and then asks the
+idempotency oracle about the ledger both attempts shared.
+
+```
+faultlab recovery-run examples/recovery_crash_before_commit.yaml -- python examples/recovery_worker.py
+```
+
+The intentional crash is applied on the first process start only. Every restart runs to `done`, to
+`error`, or into a limit, so a passing run is recovery rather than a second lucky crash.
+
+### The worker protocol
+
+The worker writes JSONL to stdout: one JSON object per line, flushed immediately, each with a
+string `event` field. stderr is captured and counted toward the byte limit, never parsed. A line
+that is not a JSON object with a string `event` is ignored as an event and still counted.
+
+| event | fields | meaning |
+| --- | --- | --- |
+| `checkpoint` | `name` | a named point the scenario can kill at |
+| `side_effect` | `operation`, `idempotency_key`, `payload_fingerprint` | the worker committed a side effect |
+| `done` | - | the worker finished its work |
+| `error` | `message` | the worker gave up; the run fails with reason `worker_error` |
+
+The harness passes two variables to the worker. `FAULTLAB_STATE_DIR` is the directory that
+survives the crash, and `FAULTLAB_LEDGER` is the SQLite ledger path inside it (`ledger.sqlite`).
+When `FAULTLAB_STATE_DIR` is already set in the environment, the harness uses that directory and
+leaves it alone, which is how you seed it with a damaged file or read it afterwards. When it is
+not set, the harness creates a temporary directory and removes it on every exit path.
+
+Reading stops the instant the kill point is parsed, so events the worker managed to write between
+the match and the signal landing cannot leak into the report. The child is started in its own
+session and the whole process group is signalled, so a worker that forked leaves nothing behind.
+
+### Scenario format
+
+```yaml
+version: 1                  # must be 1
+kind: recovery              # must be "recovery"; `faultlab validate` still rejects this document
+seed: 1                     # required integer; recorded in the report
+kill:                       # one of the two styles below, never both
+  when: after               # before | after
+  checkpoint: pre_commit    # the checkpoint name to kill around
+limits:                     # optional; every field has a default
+  runtime_ms: 10000         # default 5000
+  max_restarts: 1           # default 1
+  max_output_bytes: 65536   # default 65536, counted across all attempts
+assertions:                 # optional; default exactly-once and at-most-once
+  - exactly-once
+  - at-most-once
+```
+
+The other kill style is by event count: `event: checkpoint | side_effect`, `n:` a positive
+integer, and an optional `name:` that narrows the match to one checkpoint name or one operation.
+Unknown fields at any depth are errors, and the reported `path` names the key (`limits.budget_ms`,
+`kill.whn`). An invalid scenario exits 2 before any command is started.
+
+`runtime_ms` is a real wall-clock cap, not fake-clock milliseconds: it is the ceiling on a worker
+that hangs, and it is never recorded in the report. Exceeding a limit is a failure with reason
+`limit:runtime` or `limit:output`, and the process group is killed either way.
+
+### The three examples
+
+| scenario | where it kills | what the restart has to do |
+| --- | --- | --- |
+| `recovery_crash_before_commit.yaml` | after the `pre_commit` checkpoint | decide for itself whether the send already landed |
+| `recovery_crash_after_commit.yaml` | after the `commit` checkpoint | read its checkpoint file and skip the send |
+| `recovery_corrupt_checkpoint.yaml` | after `begin`, into a damaged state dir | fail loudly instead of sending again |
+
+`examples/recovery_worker.py` keeps a ledger and a checkpoint file in `FAULTLAB_STATE_DIR`, writes
+the checkpoint atomically (temp file, fsync, `os.replace`), and sends through
+`IdempotencyOracle.execute`. SIGKILL is asynchronous, so in the first scenario the worker may die
+before the ledger write, inside it, or just after it; all three land on a restart that commits the
+message exactly once.
+
+The third one needs a state directory you prepared:
+
+```
+mkdir -p /tmp/faultlab-corrupt
+printf 'not json' > /tmp/faultlab-corrupt/checkpoint.json
+FAULTLAB_STATE_DIR=/tmp/faultlab-corrupt faultlab recovery-run \
+    examples/recovery_corrupt_checkpoint.yaml -- python examples/recovery_worker.py
+```
+
+### The report
+
+stdout is one line of canonical JSON, the same encoding as every other report:
+
+```json
+{"assertions":["exactly-once","at-most-once"],
+ "attempts":[{"attempt":1,"checkpoints":["begin","pre_commit","commit"],"done":false,"error":null,
+   "exit_code":null,"killed":true,"limit":null,"side_effects":[{"idempotency_key":"msg-recovery",...}]},
+  {"attempt":2,"checkpoints":["begin","commit"],"done":true,"error":null,"exit_code":0,
+   "killed":false,"limit":null,"side_effects":[]}],
+ "checkpoint_sequence":["begin","pre_commit","commit","begin","commit"],
+ "duplicate_side_effects":[],"invariants":{"at-most-once":true,"exactly-once":true},
+ "kill_point_reached":true,"ledger_missing":false,"limit":null,"ok":true,"reasons":[],
+ "restarts":1,"termination_point":"after:commit","violations":[]}
+```
+
+There are no PIDs, no ports, no durations and no wall-clock times in it, so two runs of the same
+scenario and command produce byte-identical bytes. The `exit_code` of a killed attempt is `null`
+rather than the signal that killed it, for the same reason.
+
+Exit codes: `0` every assertion held and no limit was hit, `1` an invariant failed, a limit was
+hit, the kill point was never reached or the worker reported an error, `2` the scenario is invalid
+or the command could not be started. `--json-out PATH` writes the same text to a file. `--junit
+PATH` writes a JUnit XML report in the suite `faultlab-recovery`, with one `<testcase>` per
+assertion plus `kill_point_reached` and `no_duplicate_side_effects`.
+
+Out of scope, deliberately: this is not a production supervisor, not a Kubernetes or systemd
+restart policy, and not a workflow engine. It starts one local command, kills it once at a point
+you named, restarts it up to `max_restarts` times, and reports. It does not schedule, back off,
+health-check, or restart anything that is not the command you passed after `--`.
+
 ## Fake clock
 
 `faultlab.clock.FakeClock` is a millisecond counter starting at 0 that only moves when something
@@ -371,6 +491,8 @@ report, exit_code = run_scenario(scenario, "examples.retry_subject:retry_until_o
 - Not a production transaction manager. The idempotency ledger is a local SQLite file describing
   synthetic side effects inside a test; it does not coordinate, deduplicate or roll back anything
   a real system did.
+- Not a process supervisor. The recovery harness kills one local command at one named point and
+  restarts it a bounded number of times inside a test; it does not keep anything running.
 - Not a payments library, and not advice about handling money. `exactly-once` here is an assertion
   about a recorded test run, not a delivery guarantee about your infrastructure.
 
