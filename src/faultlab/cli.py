@@ -8,9 +8,11 @@ import sys
 
 from . import junit
 from .idempotency import IdempotencyOracle, Ledger, LedgerError, describe_violation
+from .recovery import RecoveryError, junit_cases, run_recovery
+from .recovery_schema import load_recovery_scenario
 from .report import dumps
 from .runner import ResolutionError, run_scenario
-from .schema import ScenarioError, load_scenario
+from .schema import ScenarioError, ValidationError, load_scenario
 
 EXIT_OK = 0
 EXIT_SUBJECT_FAILED = 1
@@ -26,11 +28,15 @@ def _ensure_cwd_importable() -> None:
         sys.path.insert(0, cwd)
 
 
-def _report_invalid(exc: ScenarioError, stderr) -> int:
+def _report_invalid(
+    exc: ScenarioError,
+    stderr,
+    consequence: str = "no subject was imported or executed",
+) -> int:
     count = len(exc.errors)
     print(
         f"faultlab: scenario invalid ({count} error{'s' if count != 1 else ''}); "
-        "no subject was imported or executed",
+        f"{consequence}",
         file=stderr,
     )
     stderr.write(dumps({"ok": False, "errors": [e.as_dict() for e in exc.errors]}))
@@ -128,6 +134,36 @@ def _cmd_oracle(args: argparse.Namespace, stdout, stderr) -> int:
     return EXIT_OK if not violations else EXIT_SUBJECT_FAILED
 
 
+def _cmd_recovery_run(args: argparse.Namespace, stdout, stderr) -> int:
+    consequence = "no command was started"
+    try:
+        scenario = load_recovery_scenario(args.path)
+    except ScenarioError as exc:
+        return _report_invalid(exc, stderr, consequence)
+
+    if not args.command:
+        exc = ScenarioError(
+            [ValidationError("command", "required; put the worker command after '--'")]
+        )
+        return _report_invalid(exc, stderr, consequence)
+
+    try:
+        payload, code = run_recovery(scenario, args.command)
+    except RecoveryError as exc:
+        print(f"faultlab: {exc}", file=stderr)
+        stderr.write(dumps({"ok": False, "errors": [{"path": "command", "message": str(exc)}]}))
+        return EXIT_INVALID
+
+    text = dumps(payload)
+    stdout.write(text)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    if args.junit:
+        junit.write(args.junit, junit_cases(payload), suite=junit.RECOVERY_SUITE)
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="faultlab",
@@ -168,13 +204,43 @@ def build_parser() -> argparse.ArgumentParser:
     oracle.add_argument("--json-out", dest="json_out", help="also write the JSON report here")
     oracle.add_argument("--junit", help="write a JUnit XML report here")
     oracle.set_defaults(func=_cmd_oracle)
+
+    recovery = subparsers.add_parser(
+        "recovery-run",
+        help="crash and restart a worker subprocess, then assert recovery invariants",
+    )
+    recovery.add_argument("path", help="path to a recovery scenario YAML file")
+    recovery.add_argument("--json-out", dest="json_out", help="also write the JSON report here")
+    recovery.add_argument("--junit", help="write a JUnit XML report here")
+    recovery.add_argument(
+        "command",
+        nargs="*",
+        metavar="COMMAND",
+        help="the worker command, after a literal '--'",
+    )
+    recovery.set_defaults(func=_cmd_recovery_run)
     return parser
+
+
+def _split_command(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Split ``recovery-run`` argv at the first '--'.
+
+    Only recovery-run takes a worker command, so no other subcommand's
+    handling of '--' changes.
+    """
+    if not argv or argv[0] != "recovery-run" or "--" not in argv:
+        return argv, None
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
 
 
 def main(argv: list[str] | None = None, stdout=None, stderr=None) -> int:
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
-    args = build_parser().parse_args(argv)
+    head, command = _split_command(list(sys.argv[1:] if argv is None else argv))
+    args = build_parser().parse_args(head)
+    if command is not None:
+        args.command = command
     return args.func(args, stdout, stderr)
 
 

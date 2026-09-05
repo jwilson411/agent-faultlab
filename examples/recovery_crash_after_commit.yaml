@@ -1,0 +1,21 @@
+# Crash the worker once the commit checkpoint is on the record, which is after
+# the side effect committed and after the checkpoint file was replaced.
+#
+#   faultlab recovery-run examples/recovery_crash_after_commit.yaml -- \
+#       python examples/recovery_worker.py
+#
+# The restart reads the checkpoint file, skips the send, and reports commit
+# again. Nothing is sent twice; the ledger still holds one commit.
+version: 1
+kind: recovery
+seed: 2
+kill:
+  when: after
+  checkpoint: commit
+limits:
+  runtime_ms: 10000
+  max_restarts: 1
+  max_output_bytes: 65536
+assertions:
+  - exactly-once
+  - at-most-once

@@ -15,6 +15,8 @@ FIXED_TIMESTAMP = "1970-01-01T00:00:00"
 FIXED_TIME = "0.000"
 DEFAULT_SUITE = "faultlab-oracle"
 DEFAULT_CLASSNAME = "faultlab.oracle"
+RECOVERY_SUITE = "faultlab-recovery"
+RECOVERY_CLASSNAME = "faultlab.recovery"
 
 
 @dataclass(frozen=True)
