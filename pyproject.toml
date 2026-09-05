@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-faultlab"
 version = "0.1.0"
-description = "Deterministic callable and HTTP fault injection for retry/fallback code."
+description = "Deterministic callable and HTTP fault injection, plus a local idempotency oracle, for retry/fallback code."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Justin Wilson" }]
-keywords = ["testing", "fault-injection", "determinism", "retry"]
+keywords = ["testing", "fault-injection", "determinism", "retry", "idempotency", "exactly-once"]
 classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.11",

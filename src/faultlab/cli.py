@@ -6,6 +6,8 @@ import argparse
 import os
 import sys
 
+from . import junit
+from .idempotency import IdempotencyOracle, Ledger, LedgerError, describe_violation
 from .report import dumps
 from .runner import ResolutionError, run_scenario
 from .schema import ScenarioError, load_scenario
@@ -13,6 +15,8 @@ from .schema import ScenarioError, load_scenario
 EXIT_OK = 0
 EXIT_SUBJECT_FAILED = 1
 EXIT_INVALID = 2
+
+ASSERTIONS = ("exactly-once", "at-most-once", "no-key-reuse")
 
 
 def _ensure_cwd_importable() -> None:
@@ -59,6 +63,71 @@ def _cmd_run(args: argparse.Namespace, stdout, stderr) -> int:
     return code
 
 
+def _run_assertion(oracle: IdempotencyOracle, name: str) -> list[dict]:
+    if name == "exactly-once":
+        return oracle.assert_exactly_once()
+    if name == "at-most-once":
+        return oracle.assert_at_most_once()
+    return oracle.assert_no_key_reuse()
+
+
+def _cmd_oracle(args: argparse.Namespace, stdout, stderr) -> int:
+    names: list[str] = []
+    for name in args.assertions or ASSERTIONS:
+        if name not in names:
+            names.append(name)
+
+    try:
+        ledger = Ledger.open_existing(args.ledger)
+    except LedgerError as exc:
+        print(f"faultlab: {exc}", file=stderr)
+        stderr.write(dumps({"ok": False, "errors": [{"path": args.ledger, "message": str(exc)}]}))
+        return EXIT_INVALID
+
+    try:
+        oracle = IdempotencyOracle(ledger)
+        per_assertion = {name: _run_assertion(oracle, name) for name in names}
+    finally:
+        ledger.close()
+
+    seen: set[str] = set()
+    violations: list[dict] = []
+    for name in names:
+        for violation in per_assertion[name]:
+            marker = dumps(violation)
+            if marker not in seen:
+                seen.add(marker)
+                violations.append(violation)
+    violations.sort(key=dumps)
+
+    payload = {
+        "assertions": names,
+        "ledger": args.ledger,
+        "ok": not violations,
+        "violations": violations,
+    }
+    text = dumps(payload)
+    stdout.write(text)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    if args.junit:
+        junit.write(
+            args.junit,
+            [
+                junit.TestCase(
+                    name=name,
+                    failures=tuple(
+                        junit.Failure(message=describe_violation(v), details=dumps(v).strip())
+                        for v in per_assertion[name]
+                    ),
+                )
+                for name in names
+            ],
+        )
+    return EXIT_OK if not violations else EXIT_SUBJECT_FAILED
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="faultlab",
@@ -83,6 +152,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit a canonical JSON report to stdout (always on; accepted for clarity)",
     )
     run.set_defaults(func=_cmd_run)
+
+    oracle = subparsers.add_parser(
+        "oracle", help="assert idempotency invariants against a recorded ledger"
+    )
+    oracle.add_argument("ledger", help="path to an existing SQLite ledger file")
+    oracle.add_argument(
+        "--assert",
+        dest="assertions",
+        action="append",
+        choices=list(ASSERTIONS),
+        metavar="NAME",
+        help="repeatable; one of " + ", ".join(ASSERTIONS) + " (default: all three)",
+    )
+    oracle.add_argument("--json-out", dest="json_out", help="also write the JSON report here")
+    oracle.add_argument("--junit", help="write a JUnit XML report here")
+    oracle.set_defaults(func=_cmd_oracle)
     return parser
 
 

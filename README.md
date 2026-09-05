@@ -11,6 +11,9 @@ what happened on each call.
 The same scenarios drive a loopback HTTP failure server, so the status codes, headers, malformed
 bodies and disconnects that a callable mock cannot express are exercised at the HTTP boundary.
 
+A local idempotency oracle records every synthetic side effect in a SQLite ledger and then answers
+whether the run stayed exactly-once, at-most-once and free of key reuse.
+
 Every run is reproducible: the fake clock starts at 0 ms, nothing sleeps, nothing leaves
 `127.0.0.1`, and reports contain no wall-clock times, hostnames or ports. The same scenario and
 seed produce byte-identical bytes on stdout.
@@ -30,6 +33,7 @@ Python 3.11+. The only runtime dependency is PyYAML.
 ```
 faultlab validate PATH
 faultlab run PATH module:function [args...]
+faultlab oracle LEDGER [--assert NAME]... [--json-out PATH] [--junit PATH]
 ```
 
 `validate` loads and checks a scenario and never imports or executes the subject.
@@ -232,6 +236,105 @@ after success, after a timeout and after an exception in the block.
 Out of scope, deliberately: forward proxying, TLS interception, load testing, DNS chaos,
 provider-specific API emulation, and any network traffic to anything other than `127.0.0.1`.
 
+## Idempotency oracle
+
+A retry that fires after the side effect already landed is how one message becomes two. Neither a
+callable mock nor an HTTP failure server can tell you that happened: the duplicate is only visible
+in the side effect. `faultlab.IdempotencyOracle` records every attempt at a synthetic side effect
+in a local SQLite ledger and then answers, afterwards, whether the run kept its invariants.
+
+```python
+from faultlab import IdempotencyOracle, Ledger, SideEffectSink
+
+with Ledger("run.sqlite") as ledger:
+    oracle = IdempotencyOracle(ledger)
+    sink = SideEffectSink(name="send_message")
+    oracle.execute("send_message", "msg-2f1c", payload, sink.send, call=1, fault="drop")
+    ...
+    assert oracle.assert_exactly_once() == []
+```
+
+`execute` is the idempotent path: it looks the key up first and replays the stored result instead
+of running the function again. `effect` always runs the function, which is what a naive retry
+does. `fault="drop"` commits and then raises `ResponseLost` instead of returning; `fault="replace"`
+commits and hands the caller something else. Both model the response being lost *after* the write
+landed.
+
+Each attempt is one ledger row:
+
+| field | meaning |
+| --- | --- |
+| `operation` | the logical side effect, e.g. `send_message` |
+| `idempotency_key` | the caller's key for this unit of work |
+| `payload_fingerprint` | sha256 of the canonical JSON payload, so key reuse is detectable |
+| `commit_point` | `0` started, `1` committed — the row that says the write landed |
+| `result` | the committed result, replayed to a later attempt on the same key |
+
+A separate `commits` table holds the canonical committed row per `(operation, idempotency_key)`
+under a UNIQUE constraint, first write wins, so a second commit is detected rather than silently
+overwriting.
+
+Four violation kinds:
+
+| kind | what happened |
+| --- | --- |
+| `duplicate_commit` | the side effect committed twice for one key with the same payload |
+| `key_reuse_different_payload` | one key was used for two different payloads |
+| `response_lost_after_commit` | the write landed but the caller never got the result |
+| `started_never_committed` | an attempt began and never reached the commit point |
+
+`at-most-once` fails on `duplicate_commit`. `no-key-reuse` fails on
+`key_reuse_different_payload`. `exactly-once` fails on a `duplicate_commit`, on a
+`started_never_committed` for a key with no commit at all, on a `response_lost_after_commit` that
+no later attempt recovered, and on an operation named explicitly that recorded no commit at all.
+So losing a response and then replaying it under the same key passes exactly-once; re-running the
+side effect does not.
+
+### `faultlab oracle`
+
+```
+faultlab oracle LEDGER --assert exactly-once --assert at-most-once --assert no-key-reuse --junit out.xml
+```
+
+`--assert` is repeatable; with none given all three run. Exit `0` when every assertion passed, `1`
+when any violation was found, `2` when the ledger is missing or is not a faultlab ledger (in which
+case a human line and a JSON error list go to stderr and stdout stays empty). stdout is one line
+of canonical JSON:
+
+```json
+{"assertions":["at-most-once"],"ledger":"run.sqlite","ok":false,
+ "violations":[{"call":2,"idempotency_key":"msg-2f1c","kind":"duplicate_commit",
+   "message":"side effect committed again for a key already committed on call 1",
+   "operation":"send_message","payload_fingerprint":"500d5a53..."}]}
+```
+
+`--json-out PATH` writes that same text to a file. `--junit PATH` writes a JUnit XML report with
+one `<testcase>` per assertion, named exactly `exactly-once`, `at-most-once` and `no-key-reuse`,
+each failed one carrying a `<failure>` whose message names the kind, the operation and the call.
+The XML has no wall-clock timestamp and no measured duration, so it diffs cleanly and can be
+committed as a fixture.
+
+### Naive versus idempotent
+
+`examples/idempotency_subjects.py` has two retry loops around the same side effect, the same key
+and the same payload. Both meet the same fault: the first attempt commits and then loses its
+response. `naive_retry` retries through `oracle.effect` and sends again; `idempotent_retry`
+retries through `oracle.execute` and replays.
+
+```
+$ python -m examples.idempotency_demo
+{"assertions":["exactly-once","at-most-once","no-key-reuse"],"client":"naive","commits":1,
+ "ok":false,"result":{"delivery":2,...},"side_effects":2,
+ "violations":[{"call":2,"kind":"duplicate_commit","operation":"send_message",...}]}
+{"assertions":["exactly-once","at-most-once","no-key-reuse"],"client":"idempotent","commits":1,
+ "ok":true,"result":{"delivery":1,...},"side_effects":1,"violations":[]}
+```
+
+Same scenario, same fault: the naive client ran the side effect twice and fails exactly-once and
+at-most-once, the idempotent client ran it once and passes all three. Nothing here sleeps
+or reads the wall clock; the ledgers land in a temporary directory unless `--ledger DIR` says
+otherwise.
+
 ## Fake clock
 
 `faultlab.clock.FakeClock` is a millisecond counter starting at 0 that only moves when something
@@ -265,6 +368,11 @@ report, exit_code = run_scenario(scenario, "examples.retry_subject:retry_until_o
 - Not a benchmark. Reports carry fake-clock milliseconds, never measured durations.
 - No framework plugins, no chat UI, no model calls. The only network traffic is loopback, between
   a test and the HTTP failure server it started.
+- Not a production transaction manager. The idempotency ledger is a local SQLite file describing
+  synthetic side effects inside a test; it does not coordinate, deduplicate or roll back anything
+  a real system did.
+- Not a payments library, and not advice about handling money. `exactly-once` here is an assertion
+  about a recorded test run, not a delivery guarantee about your infrastructure.
 
 ## Development
 
