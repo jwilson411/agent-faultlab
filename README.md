@@ -1,15 +1,19 @@
 # agent-faultlab
 
-Deterministic fault injection for a single Python callable, driven by a YAML scenario.
+Deterministic fault injection for a Python callable or a loopback HTTP endpoint, driven by a YAML
+scenario.
 
 Retry loops, fallback chains and backoff policies are usually tested with ad hoc mocks that
 encode the failure pattern in imperative test code. `agent-faultlab` moves that pattern into a
 declarative scenario file, wraps the tool callable, and emits a canonical JSON report of exactly
 what happened on each call.
 
-Every run is reproducible: the fake clock starts at 0 ms, nothing sleeps, nothing touches the
-network, and the report contains no wall-clock times or hostnames. The same scenario and seed
-produce byte-identical bytes on stdout.
+The same scenarios drive a loopback HTTP failure server, so the status codes, headers, malformed
+bodies and disconnects that a callable mock cannot express are exercised at the HTTP boundary.
+
+Every run is reproducible: the fake clock starts at 0 ms, nothing sleeps, nothing leaves
+`127.0.0.1`, and reports contain no wall-clock times, hostnames or ports. The same scenario and
+seed produce byte-identical bytes on stdout.
 
 ## Install
 
@@ -65,7 +69,7 @@ rules:                      # non-empty; ids must be unique
     when: before            # before | after, relative to the wrapped call
     match: nth              # nth | next_n | always
     n: 1                    # required for nth and next_n, forbidden for always
-    inject:                 # exactly one of the four kinds below
+    inject:                 # exactly one of the five kinds below
       delay_ms: 250
 ```
 
@@ -83,6 +87,7 @@ Inject kinds, exactly one per rule:
 | `exception: {type: TimeoutError, message: "..."}` | raises; `before` skips the real call |
 | `return: <value>` | returns the value; `before` skips the real call, `after` replaces the result |
 | `malformed: {value: <value>}` | same as `return`, but tagged `malformed` in the report |
+| `http: {action: status, status: 429}` | the response of the HTTP failure server; see below |
 
 Exception types resolve against builtins first, then as `module:Name`.
 
@@ -156,7 +161,76 @@ Actual stdout is one line of canonical JSON
 reports diff cleanly and can be committed as fixtures.
 
 Other scenarios in `examples/`: `nth.yaml`, `next_n.yaml`, `after_malformed.yaml`,
-`delay_fake_clock.yaml`.
+`delay_fake_clock.yaml`, `http_429_then_ok.yaml`.
+
+## HTTP failure server
+
+Callable mocks cannot show how client code handles status codes, headers, malformed bodies,
+disconnects or retry timing, because none of that exists above the HTTP boundary.
+`faultlab.HttpFaultServer` is that boundary: an in-process server, bound to `127.0.0.1` on an
+ephemeral port, that answers each request with the action of the first matching `http` inject.
+
+```python
+from faultlab import FakeClock, HttpFaultServer, load_scenario
+
+clock = FakeClock()
+with HttpFaultServer(load_scenario("examples/http_429_then_ok.yaml"), clock=clock) as server:
+    call_my_client(server.base_url)   # http://127.0.0.1:<port>
+print(server.report())
+```
+
+The bind address is always `127.0.0.1`; the server never listens on `0.0.0.0` and never talks to
+anything else. Rule matching is the AF-01 matching: `when` / `match` / `n` / `id`, against the
+1-based request count. `http` injects are the response itself, so only `when: before` is accepted;
+`when: after` is a validation error. Overlapping `http` injects are contradiction-checked like
+every other kind. When no rule matches, the response is `200` with the JSON body `{"ok": true}`.
+
+```yaml
+inject:
+  http:
+    action: status          # required
+    status: 429             # required when action is 'status', forbidden otherwise
+    headers: {X-Trace: abc} # optional, str -> str
+    body: "..."             # optional; a string is sent as-is, anything else as JSON
+    retry_after: 2          # optional; emitted as the Retry-After header, stringified
+```
+
+| action | effect |
+| --- | --- |
+| `status` | sends the given status code (429, 500, 502, 503, 504, any other) |
+| `timeout` | accepts the connection and sends nothing; the client times out |
+| `close_before_headers` | accepts, then closes the socket before any status line |
+| `truncated_body` | sends a `Content-Length` larger than the bytes written, then closes |
+| `malformed_json` | 200 with `Content-Type: application/json` and a body that is not JSON |
+| `success` | 200 with a JSON success body |
+
+The server never sleeps. `timeout` withholds the response until the client hangs up or the server
+is torn down, and `retry_after` is paid by the subject on the `FakeClock`, so a scenario with two
+2-second retries advances the clock 4000 ms while the test finishes in milliseconds of wall time.
+
+`server.records` is a list of `HttpRequestRecord`: request count, method, path with query, headers,
+sha256 of the raw request body, the action taken with its status, and fake-clock milliseconds
+before and after handling. Bodies are hashed, never stored. Header values for `authorization`,
+`cookie`, `set-cookie`, `x-api-key` and `proxy-authorization` are replaced with `<redacted>`
+case-insensitively, plus any name passed as `redact_extra=`; redaction happens before a record
+exists, so no unredacted copy is kept. The `Host` header is dropped because it only carries the
+ephemeral port. `server.report()` adds the seed, the request count and the fake clock, and is
+ready for `dumps` — no wall clock, no hostnames, no port.
+
+`tests/conftest.py` provides the `http_fault_server` fixture, a factory that starts a server from
+a `Scenario` or an inline YAML string and always stops it, even when the test fails:
+
+```python
+def test_gives_up_after_bounded_retries(http_fault_server):
+    server = http_fault_server(scenario, clock=clock, redact_extra=["x-tenant-token"])
+    ...
+```
+
+`stop()` runs `shutdown`, `server_close` and joins the serving thread, and `__exit__` calls it
+after success, after a timeout and after an exception in the block.
+
+Out of scope, deliberately: forward proxying, TLS interception, load testing, DNS chaos,
+provider-specific API emulation, and any network traffic to anything other than `127.0.0.1`.
 
 ## Fake clock
 
@@ -189,7 +263,8 @@ report, exit_code = run_scenario(scenario, "examples.retry_subject:retry_until_o
   is recorded so that a future stochastic matcher stays reproducible, but rule matching today is
   fully determined.
 - Not a benchmark. Reports carry fake-clock milliseconds, never measured durations.
-- No framework plugins, no chat UI, no network calls, no model calls.
+- No framework plugins, no chat UI, no model calls. The only network traffic is loopback, between
+  a test and the HTTP failure server it started.
 
 ## Development
 

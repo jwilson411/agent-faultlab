@@ -7,6 +7,8 @@ import pytest
 
 import yaml
 
+from faultlab.clock import FakeClock
+from faultlab.http_server import HttpFaultServer
 from faultlab.schema import Scenario, validate_document
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +19,29 @@ if str(REPO_ROOT) not in sys.path:
 def scenario_from(text: str) -> Scenario:
     """Validate an inline YAML scenario, returning the parsed Scenario."""
     return validate_document(yaml.safe_load(text), source="<inline>")
+
+
+@pytest.fixture
+def http_fault_server():
+    """Factory for started HttpFaultServers; every one is torn down after the test."""
+    started: list[HttpFaultServer] = []
+
+    def start(
+        scenario: Scenario | str,
+        clock: FakeClock | None = None,
+        redact_extra=None,
+    ) -> HttpFaultServer:
+        if isinstance(scenario, str):
+            scenario = scenario_from(scenario)
+        server = HttpFaultServer(scenario, clock=clock, redact_extra=redact_extra)
+        started.append(server)
+        return server.start()
+
+    try:
+        yield start
+    finally:
+        for server in started:
+            server.stop()
 
 
 @pytest.fixture(autouse=True)
